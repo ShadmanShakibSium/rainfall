@@ -1,5 +1,5 @@
 // Rainfall service worker — bump VERSION whenever you change the files below
-const VERSION = 'rainfall-v1';
+const VERSION = 'rainfall-v3';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './favicon.ico',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
