@@ -59,13 +59,32 @@
       margin: 0
     }
 
+    html {
+      background: #0a1f29
+    }
+
     body {
       font-family: Figtree, system-ui, sans-serif;
       color: var(--ink);
       min-height: 100vh;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
       padding-top: env(safe-area-inset-top, 0px);
       padding-bottom: env(safe-area-inset-bottom, 0px);
-      background: radial-gradient(70% 45% at 50% 108%, rgba(60, 150, 172, .22), transparent 70%), linear-gradient(180deg, #050e14 0%, #0a1f29 58%, #0c2833 100%) fixed
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation
+    }
+
+    /* fixed gradient layer (much cheaper on phones than background-attachment: fixed) */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      background: radial-gradient(70% 45% at 50% 108%, rgba(60, 150, 172, .22), transparent 70%), linear-gradient(180deg, #050e14 0%, #0a1f29 58%, #0c2833 100%);
+      transform: translateZ(0)
     }
 
     button {
@@ -87,13 +106,15 @@
       inset: 0;
       width: 100%;
       height: 100%;
-      pointer-events: none
+      pointer-events: none;
+      transform: translateZ(0)
     }
 
     .wrap {
       position: relative;
+      width: 100%;
+      flex: 1 0 auto;
       max-width: 1040px;
-      min-height: 100vh;
       margin: 0 auto;
       padding: 8vh 28px;
       display: grid;
@@ -382,10 +403,14 @@
       padding-right: 2px
     }
 
+    /* "Made by" — always the last thing on the page */
     .foot {
-      margin-top: 28px;
+      position: relative;
+      flex: none;
+      text-align: center;
+      padding: 18px 20px 22px;
       color: var(--mute);
-      font-size: .78rem
+      font-size: .8rem
     }
 
     .foot a {
@@ -435,7 +460,7 @@
         grid-template-columns: 1fr;
         gap: 40px;
         align-items: start;
-        padding: 44px 20px 60px
+        padding: 44px 20px 40px
       }
 
       #play {
@@ -487,10 +512,10 @@
       <div class="list" id="list"></div>
       <button class="addbtn" id="addbtn" aria-expanded="false"><i class="fa-solid fa-plus"></i>Add a sound</button>
       <div class="more" id="more" hidden></div>
-      <!-- EDIT ME: footer / credits -->
-      <p class="foot">Made by <a href="https://aboutshadman.netlify.app/" rel="author noopener">Md. Shadman Shakib Sium</a></p>
     </section>
   </div>
+
+  <footer class="foot">Made by <a href="https://aboutshadman.netlify.app/" rel="author noopener">Md. Shadman Shakib Sium</a></footer>
 
   <script>
 
@@ -506,6 +531,8 @@
     };
     const FIRST_VISIT = ['rain', 'thunder'];
     const EXT = ['mp3', 'wav', 'ogg', 'm4a'];
+    const XF = 5; 
+    const RAMP = .025; 
     const $ = id => document.getElementById(id);
 
     /* ---------- PWA: service worker + install button ---------- */
@@ -527,56 +554,134 @@
       if (s && Array.isArray(s.sel)) { sel = s.sel.filter(k => CATS[k]); vol = s.vol || {}; master = s.master ?? .8; }
     } catch (e) { }
     if (!sel) sel = [...FIRST_VISIT];
-    const save = () => { try { localStorage.setItem('rainsounds', JSON.stringify({ sel, vol, master })); } catch (e) { } };
+    let saveT;
+    const save = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem('rainsounds', JSON.stringify({ sel, vol, master })); } catch (e) { } }, 300); };
     const vOf = k => vol[k] ?? .7;
     const fill = r => r.style.setProperty('--p', (r.value * 100) + '%');
 
-    /* ---------- audio (a category is only touched once it is selected) ---------- */
-    const runtime = {};
-    const exists = u => new Promise(r => {
-      const a = new Audio(); a.preload = 'metadata';
-      a.onloadedmetadata = () => r(true); a.onerror = () => r(false);
-      setTimeout(() => r(false), 4000); a.src = u;
-    });
-    async function scan(k) {
-      const files = [];
-      for (let n = 1; n <= 60; n++) {
-        let hit = null;
-        for (const e of EXT) { const u = `sounds/${k}/${n}.${e}`; if (await exists(u)) { hit = u; break; } }
-        if (!hit) break;
-        files.push(hit);
+    /* ---------- audio ---------- */
+    const runtime = {}, pending = [];
+    let loaded = false;
+    const freeEl = e => { e.pause(); e.removeAttribute('src'); e.load(); };
+    const level = k => Math.min(1, Math.max(0, vOf(k) * master * fade));
+    const applyVol = k => { const c = runtime[k]; c.els.forEach((e, i) => { e.volume = Math.min(1, Math.max(0, level(k) * c.g[i])); }); };
+
+    // cheap existence check (HEAD request, no audio data downloaded)
+    async function resolve(k, n) {
+      const c = runtime[k]; if (n in c.urls) return c.urls[n];
+      let hit = false;
+      for (const e of EXT) {
+        const u = `sounds/${k}/${n}.${e}`;
+        try {
+          const r = await fetch(u, { method: 'HEAD' });
+          if (r.ok && !/text\/html/i.test(r.headers.get('content-type') || '')) { hit = u; break; }
+        } catch (_) { }
       }
-      return files;
+      return c.urls[n] = hit;
     }
     function ensure(k) {
       if (runtime[k]) return;
-      const c = runtime[k] = { files: [], ready: false, active: false, cur: null, a: new Audio(), row: null };
-      c.a.onended = () => { if (c.active) playRandom(k); };
-      scan(k).then(f => { c.files = f; c.ready = true; paintInfo(k); sync(); });
+      const c = runtime[k] = { els: [new Audio(), new Audio()], g: [0, 0], cur: -1, n: 0, count: 0, urls: {}, first: null, ready: false, active: false, xf: null, next: null, tok: 0, row: null };
+      c.els.forEach((e, i) => {
+        e.preload = 'auto';
+        e.onended = () => { if (c.active && !c.xf && i === c.cur) advance(k); };
+        e.onerror = () => {
+          if (!e.getAttribute('src') || !c.active) return;
+          if (c.xf && i === c.xf.to) c.xf.bad = true; else if (i === c.cur) advance(k);
+        };
+      });
+      loaded ? prime(k) : pending.push(k);
     }
-    const level = k => Math.min(1, Math.max(0, vOf(k) * master * fade));
-    function playRandom(k) {
-      const c = runtime[k]; if (!c.files.length) return;
-      let f = c.files[Math.floor(Math.random() * c.files.length)];
-      if (c.files.length > 1 && f === c.cur) { const r = c.files.filter(x => x !== c.cur); f = r[Math.floor(Math.random() * r.length)]; }
-      c.cur = f; c.a.loop = c.files.length === 1; c.a.src = f; c.a.volume = level(k);
-      c.a.play().catch(() => { });
+    function prime(k) {
+      const c = runtime[k];
+      resolve(k, 1).then(u => {
+        c.first = u; c.ready = true;
+        if (u && sel.includes(k) && c.cur < 0 && !c.els[0].getAttribute('src')) c.els[0].src = u;   // pre-buffer first file
+        paintInfo(k); sync();
+      });
+    }
+    const boot = () => { if (loaded) return; loaded = true; pending.splice(0).forEach(prime); };
+    if (document.readyState === 'complete') boot();
+    else addEventListener('load', () => (window.requestIdleCallback ? requestIdleCallback(boot, { timeout: 2500 }) : setTimeout(boot, 300)));
+
+    async function planNext(k) {
+      const c = runtime[k], tok = ++c.tok; let n, u;
+      if (c.count === 1) { n = 1; u = c.urls[1]; }
+      else if (c.count > 1) {
+        do { n = 1 + Math.floor(Math.random() * c.count); } while (n === c.n);
+        u = await resolve(k, n);
+      } else {
+        n = c.n + 1; u = await resolve(k, n);
+        if (!u) { c.count = c.n; n = 1; u = c.urls[1] || await resolve(k, 1); }
+      }
+      if (tok === c.tok) c.next = u ? { n, url: u } : null;
+    }
+    function startFirst(k) {
+      const c = runtime[k], e = c.els[0];
+      if (!e.getAttribute('src')) e.src = c.first;
+      c.n = 1; c.cur = 0; c.g = [1, 0]; c.xf = null; c.next = null;
+      e.play().catch(() => { });
+      planNext(k);
+    }
+    async function advance(k) {       // hard switch (only used if a track ends without a crossfade)
+      const c = runtime[k];
+      if (!c.next) await planNext(k);
+      if (!c.next || !c.active) return;
+      const from = c.cur, to = 1 - from, el = c.els[to];
+      freeEl(c.els[from]); c.g[from] = 0;
+      el.src = c.next.url; c.g[to] = 1; c.cur = to; c.n = c.next.n; c.next = null; c.xf = null;
+      el.play().catch(() => { });
+      applyVol(k); planNext(k);
+    }
+    function resetCat(k) {
+      const c = runtime[k]; c.tok++; c.active = false;
+      c.els.forEach(freeEl); c.cur = -1; c.n = 0; c.g = [0, 0]; c.xf = null; c.next = null;
     }
     function sync() {
       Object.keys(runtime).forEach(k => {
-        const c = runtime[k], want = playing && sel.includes(k) && c.files.length > 0;
-        c.a.volume = level(k);
-        if (want && !c.active) { c.active = true; playRandom(k); }
-        else if (!want && c.active) { c.active = false; c.a.pause(); }
+        const c = runtime[k], on = sel.includes(k), want = playing && on && c.ready && !!c.first;
+        if (!on && (c.cur > -1 || c.els[0].getAttribute('src') || c.els[1].getAttribute('src'))) resetCat(k);
+        if (want && !c.active) {
+          c.active = true;
+          if (c.cur < 0) startFirst(k);
+          else c.els.forEach((e, i) => { if (i === c.cur || (c.xf && i === c.xf.to)) e.play().catch(() => { }); });
+        } else if (!want && c.active) { c.active = false; c.els.forEach(e => e.pause()); }
+        applyVol(k);
         if (c.row) c.row.classList.toggle('live', want);
       });
     }
+    // crossfade engine: runs every 100ms while playing
+    setInterval(() => {
+      if (!playing) return;
+      const now = performance.now();
+      for (const k in runtime) {
+        const c = runtime[k]; if (!c.active || c.cur < 0) continue;
+        if (c.xf) {
+          const x = c.xf, p = Math.min(1, (now - x.t0) / (x.len * 1000));
+          if (x.bad) { freeEl(c.els[x.to]); c.g[x.to] = 0; c.g[x.from] = 1; c.xf = null; c.next = null; planNext(k); applyVol(k); continue; }
+          c.g[x.from] = Math.cos(p * Math.PI / 2); c.g[x.to] = Math.sin(p * Math.PI / 2);
+          if (p >= 1) { freeEl(c.els[x.from]); c.g[x.from] = 0; c.g[x.to] = 1; c.cur = x.to; c.xf = null; planNext(k); }
+          applyVol(k); continue;
+        }
+        const cur = c.els[c.cur], d = cur.duration;
+        if (!isFinite(d) || d <= 0 || !c.next) continue;
+        const xl = Math.min(XF, d / 3), left = d - cur.currentTime, idle = 1 - c.cur, ie = c.els[idle];
+        if (left <= xl + 4 && !ie.getAttribute('src')) ie.src = c.next.url;              // start buffering the next file
+        if (left <= xl && ie.getAttribute('src')) {                                        // start crossfade
+          c.g[idle] = 0; ie.play().catch(() => { });
+          c.xf = { from: c.cur, to: idle, t0: now, len: xl }; c.n = c.next.n; c.next = null;
+        }
+      }
+    }, 100);
+
     function setPlay(p) {
-      clearInterval(fadeTimer); fade = 1; playing = p;
+      clearInterval(fadeTimer); playing = p; fade = p ? 0 : 1;      // every play starts from silence and rises smoothly
       $('play').innerHTML = '<i class="fa-solid fa-' + (p ? 'pause' : 'play') + '"></i>';
       $('play').classList.toggle('on', p);
       $('play').setAttribute('aria-label', p ? 'Pause' : 'Play');
+      if (p) boot();
       sync();
+      if (p) fadeTimer = setInterval(() => { fade = Math.min(1, fade + RAMP); sync(); if (fade >= 1) clearInterval(fadeTimer); }, 100);
     }
     $('play').onclick = () => setPlay(!playing);
     $('mv').value = master; fill($('mv'));
@@ -585,7 +690,7 @@
     /* ---------- sound list ---------- */
     function paintInfo(k) {
       const c = runtime[k]; if (!c || !c.row) return;
-      c.row.querySelector('.err').textContent = (c.ready && !c.files.length) ? 'No files in sounds/' + k + '/' : '';
+      c.row.querySelector('.err').textContent = (c.ready && !c.first) ? 'No files in sounds/' + k + '/' : '';
     }
     function render() {
       const l = $('list'); l.innerHTML = '';
@@ -639,6 +744,7 @@
     }
     function fadeOut() {
       $('tclock').textContent = 'Fading out…';
+      clearInterval(fadeTimer);
       fadeTimer = setInterval(() => {
         fade = Math.max(0, fade - .05); sync();
         if (fade <= 0) { setPlay(false); setTimer(0); }
@@ -649,37 +755,43 @@
       if (m > 0 && m <= 720) setTimer(m);
     };
 
-    /* ---------- ripples on dark water: the rain you pick sets how hard it falls ---------- */
+    /* ---------- ripples on dark water (lightweight on phones) ---------- */
     (function () {
       const cv = $('pond'), g = cv.getContext('2d');
       const still = matchMedia('(prefers-reduced-motion:reduce)').matches;
-      let W, H, S, rip = [], acc = 0, last = performance.now();
+      const small = matchMedia('(max-width:820px)').matches || matchMedia('(pointer:coarse)').matches;
+      const MAXR = small ? 20 : 45, STEP = 1000 / (small ? 30 : 60) - 2, RINGS = small ? 2 : 3, K = small ? .55 : 1;
+      let W, H, S, rip = [], acc = 0, last = performance.now(), lastDraw = 0;
       const rnd = (a, b) => a + Math.random() * (b - a);
-      function size() { S = Math.min(2, devicePixelRatio || 1); W = cv.width = innerWidth * S; H = cv.height = innerHeight * S; }
+      function size() { S = small ? 1 : Math.min(2, devicePixelRatio || 1); W = cv.width = innerWidth * S; H = cv.height = innerHeight * S; }
       function spawn(t) {
+        if (rip.length >= MAXR) return;
         const y = H * rnd(.32, 1), depth = y / H;
         rip.push({ x: rnd(0, W), y, t0: t, dur: rnd(1700, 2900), max: (30 + 130 * depth) * S * rnd(.55, 1.1), a: .18 + .32 * depth });
       }
       function frame(t) {
+        if (!still) requestAnimationFrame(frame);
+        if (t - lastDraw < STEP) return;
+        lastDraw = t;
         const dt = Math.min(.1, (t - last) / 1000); last = t;
         const rain = playing && sel.includes('rain');
-        const rate = playing ? (rain ? 1.5 + 13 * vOf('rain') * master * fade : 1.2 * master * fade) : .22;
+        const rate = (playing ? (rain ? 1.5 + 13 * vOf('rain') * master * fade : 1.2 * master * fade) : .22) * K;
         acc += rate * dt; while (acc >= 1) { acc -= 1; spawn(t); }
         g.clearRect(0, 0, W, H); g.lineWidth = Math.max(1, S * .9);
         rip = rip.filter(r => t - r.t0 < r.dur);
         rip.forEach(r => {
           const age = (t - r.t0) / r.dur;
           if (age < .1) { g.fillStyle = `rgba(190,240,248,${.5 * (1 - age / .1)})`; g.beginPath(); g.ellipse(r.x, r.y, 2.2 * S, .9 * S, 0, 0, 7); g.fill(); }
-          for (let i = 0; i < 3; i++) {
+          for (let i = 0; i < RINGS; i++) {
             const a2 = age - i * .1; if (a2 <= 0 || a2 >= 1) continue;
             const e = 1 - Math.pow(1 - a2, 2.2), rx = r.max * (1 - i * .27) * e;
             g.strokeStyle = `rgba(165,232,242,${r.a * Math.pow(1 - a2, 1.8) * (1 - i * .3)})`;
             g.beginPath(); g.ellipse(r.x, r.y, rx, rx * .34, 0, 0, 7); g.stroke();
           }
         });
-        if (!still) requestAnimationFrame(frame);
       }
       addEventListener('resize', size); size();
+      document.addEventListener('visibilitychange', () => { last = performance.now(); });
       if (still) { for (let i = 0; i < 8; i++) { spawn(performance.now() - 600); } frame(performance.now()); }
       else requestAnimationFrame(frame);
     })();
